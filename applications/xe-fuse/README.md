@@ -150,13 +150,12 @@ xe_fuse::standalone::gelu(q, data, M, N, L);
 xe_fuse::standalone::rope_scaled(q, data, tmp, scale, cos_sin, M, N, L);
 ```
 
-## Autotune Pipeline (LLM-driven)
+## Kernel Generator
 
-The `autotune/` directory supports automated kernel exploration:
+The `autotune/` directory contains tooling for generating kernel benchmarks from specs:
 
 1. `generate_kernel.py` — generates C++ source from preset or JSON spec
 2. `run_kernel.sh` — sbatch template: compile + benchmark with structured output
-3. An LLM agent generates a spec → compiles → benchmarks → parses TFlop/s → iterates
 
 ## File Layout
 
