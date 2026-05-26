@@ -95,6 +95,25 @@ inline void swiglu(sycl::queue& q, bf16* data, int M, int N, int L) {
   });
 }
 
+// GeGLU on adjacent column pairs: output = gelu(gate) * up
+inline void geglu(sycl::queue& q, bf16* data, int M, int N, int L) {
+  int64_t total = static_cast<int64_t>(M) * N * L;
+  int n_val = N;
+  q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+    int64_t i = idx[0];
+    int col = static_cast<int>(i % n_val);
+    int64_t row_base = i - col;
+    int even_col = col & ~1;
+    int odd_col = even_col + 1;
+    if (odd_col < n_val) {
+      float gate = static_cast<float>(data[row_base + even_col]);
+      float up = static_cast<float>(data[row_base + odd_col]);
+      float gelu_gate = gate * 0.5f * (1.0f + sycl::erf(gate * 0.7071067811865475f));
+      data[i] = static_cast<bf16>(gelu_gate * up);
+    }
+  });
+}
+
 // RoPE rotation on adjacent column pairs using cos_sin tensor
 // Requires tmp buffer (same size as data) for read-only source
 inline void rope(sycl::queue& q, bf16* data, bf16 const* tmp,

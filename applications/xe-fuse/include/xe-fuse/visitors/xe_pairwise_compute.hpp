@@ -77,6 +77,17 @@ struct SwiGLUFn {
   }
 };
 
+// GeGLU: given interleaved (gate, up) pairs, compute gelu(gate) * up
+// Same structure as SwiGLU but with GeLU activation instead of SiLU.
+struct GeGLUFn {
+  CUTLASS_DEVICE float operator()(float my_val, float partner_val, bool is_even) const {
+    float gate = is_even ? my_val : partner_val;
+    float up   = is_even ? partner_val : my_val;
+    float gelu_gate = gate * 0.5f * (1.0f + sycl::erf(gate * 0.7071067811865475f));
+    return gelu_gate * up;
+  }
+};
+
 // RoPE rotation: given interleaved (x_even, x_odd) and external (cos, sin),
 // compute: even = x_even * cos + x_odd * sin
 //          odd  = -x_even * sin + x_odd * cos

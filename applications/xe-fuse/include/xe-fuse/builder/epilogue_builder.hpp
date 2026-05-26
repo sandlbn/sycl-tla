@@ -145,6 +145,10 @@ using Pairwise = EVT<XePairwiseCompute<PairwiseFn>, Input>;
 template <typename Input>
 using SwiGLU = Pairwise<SwiGLUFn, Input>;
 
+// GeGLU on pairwise columns of input (Gemma-style gated FFN)
+template <typename Input>
+using GeGLU = Pairwise<GeGLUFn, Input>;
+
 // ============================================================
 // RoPE — Rotary Position Embedding
 // ============================================================

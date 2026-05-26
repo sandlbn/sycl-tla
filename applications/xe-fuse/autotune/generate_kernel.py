@@ -203,6 +203,29 @@ PRESETS = {
             "typename xe_fuse::XePairwiseCompute<xe_fuse::SwiGLUFn>::Arguments swiglu_args{};",
             "typename EVT::Arguments evt_args{rms_args, swiglu_args};"
         ]
+    },
+    "k2_geglu": {
+        "name": "K2_RmsNormGeGLU",
+        "evt_description": "D = GeGLU(acc * R[m])",
+        "tile_shape": "_256, _256, _32",
+        "evt_typedefs": "using EVT = b::GeGLU<b::ScaleRows<b::Acc, TileShape, float>>;",
+        "aux_data": [
+            {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
+        ],
+        "evt_args": [
+            "// Inner: ScaleRows",
+            "typename b::Acc::Arguments accum_args{};",
+            "typename b::ColBroadcast<0, TileShape, float>::Arguments scale_args;",
+            "scale_args.ptr_col = block_scale.get();",
+            "scale_args.null_default = float(1);",
+            "scale_args.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};",
+            "typename b::MulOp<float, float>::Arguments mul_args{};",
+            "typename b::ScaleRows<b::Acc, TileShape, float>::Arguments rms_args{accum_args, scale_args, mul_args};",
+            "",
+            "// Outer: GeGLU",
+            "typename xe_fuse::XePairwiseCompute<xe_fuse::GeGLUFn>::Arguments geglu_args{};",
+            "typename EVT::Arguments evt_args{rms_args, geglu_args};"
+        ]
     }
 }
 
