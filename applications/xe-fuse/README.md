@@ -171,7 +171,6 @@ xe-fuse/
 │   └── standalone/ops.hpp              — Element-wise SYCL baselines
 ├── autotune/                           — Python kernel generator + runner
 ├── tests/                              — Correctness + benchmark scripts
-└── reports/                            — Status reports, slides, roofline
 ```
 
 ## Performance (BMG G31, bf16, 256×256×32 tiles)
