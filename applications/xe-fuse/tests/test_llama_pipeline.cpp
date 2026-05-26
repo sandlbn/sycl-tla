@@ -12,6 +12,7 @@
 #include "xe-fuse/kernels/gemm_dual_output.hpp"
 #include "xe-fuse/kernels/gemm_rmsnorm_swiglu.hpp"
 #include "xe-fuse/kernels/compute_rstd.hpp"
+#include "xe-fuse/standalone/ops.hpp"
 
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/command_line.h"
@@ -34,6 +35,40 @@ using K4_Config = xe_fuse::GemmRmsNormRoPE<>;
 using K1_Config = xe_fuse::GemmRmsNorm<>;
 using K0_Config = xe_fuse::GemmDualOutput<>;
 using K2_Config = xe_fuse::GemmRmsNormSwiGLU<>;
+
+struct BareGemm {
+  using ElementA = cutlass::bfloat16_t;
+  using ElementB = cutlass::bfloat16_t;
+  using ElementD = cutlass::bfloat16_t;
+  using ElementAcc = float;
+  using ElementCompute = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::RowMajor;
+  using TileShape = cute::Shape<cute::_256, cute::_256, cute::_32>;
+  using StrideC = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+  using StrideD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Xe20, cutlass::arch::OpClassTensorOp,
+      TileShape, cute::Shape<cute::_1, cute::_1, cute::_1>,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAcc, ElementCompute,
+      ElementD, StrideC, 8, ElementD, StrideD, 8,
+      cutlass::epilogue::collective::EpilogueScheduleAuto
+  >::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Xe20, cutlass::arch::OpClassTensorOp,
+      ElementA, LayoutA, 8, ElementB, LayoutB, 8,
+      ElementAcc, TileShape, cute::Shape<cute::_1, cute::_1, cute::_1>,
+      cutlass::gemm::collective::StageCountAuto,
+      cutlass::gemm::collective::KernelScheduleAuto
+  >::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
 
 struct Options {
   int m = 1024, h = 1024, inter = 2048, l = 1;
@@ -103,6 +138,7 @@ int main(int argc, const char** argv) {
   cutlass::DeviceAllocation<float> ref_f32(max_mn);
   cutlass::DeviceAllocation<bf16> ref_bf16(max_mn);
   cutlass::DeviceAllocation<bf16> ref_bf16_aux(mh);
+  cutlass::DeviceAllocation<bf16> tmp_buf(mh);
 
   // Initialize
   initialize_block(x, 2023);
@@ -375,11 +411,13 @@ int main(int argc, const char** argv) {
   // === Benchmark ===
   if (opts.iterations > 0) {
     std::cout << "\n=== Benchmark: " << opts.iterations << " iterations ===" << std::endl;
+    std::cout << "Pipeline: " << M << "x" << H << " hidden, " << I << " intermediate\n" << std::endl;
 
-    // Warm-up
+    double flops = 2.0 * M * (3.0 * H * H + static_cast<double>(N_ffn) * H) * L;
+
+    // --- Fused pipeline ---
     xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
-    k4_op.run(); k1_op.run();
-    k0_op.run();
+    k4_op.run(); k1_op.run(); k0_op.run();
     xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
     k2_op.run();
     compat::wait();
@@ -388,26 +426,114 @@ int main(int argc, const char** argv) {
     timer.start();
     for (int i = 0; i < opts.iterations; ++i) {
       xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
-      k4_op.run();
-      k1_op.run();
-      k0_op.run();
+      k4_op.run(); k1_op.run(); k0_op.run();
       xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
       k2_op.run();
     }
     compat::wait();
-    float time_s = timer.seconds() / opts.iterations;
+    float fused_s = timer.seconds() / opts.iterations;
 
-    // FLOP count: K4(MHH) + K1(MHH) + K0(MHH) + K2(M*N_ffn*H)
-    // = 2M * (3H² + N_ffn*H) — the factor 2 for GEMM FMA
-    double flops = 2.0 * M * (3.0 * H * H + static_cast<double>(N_ffn) * H) * L;
-    double tflops = flops * 1e-12 / time_s;
+    printf("Fused pipeline (GEMM + epilogue):\n");
+    printf("  Time: %.4f ms\n", fused_s * 1000);
+    printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / fused_s);
 
-    std::cout << "Pipeline: " << M << "x" << H << " hidden, " << I << " intermediate" << std::endl;
-    printf("  Time: %.4f ms\n", time_s * 1000);
-    printf("  Aggregate: %.3f TFlop/s (4 GEMMs + 2 rstd)\n", tflops);
+    // --- Unfused pipeline (bare GEMM + standalone ops) ---
+    using BareOp = typename BareGemm::Gemm;
+    using BareKernel = typename BareGemm::Gemm::GemmKernel;
 
-    // Per-GEMM breakdown would require individual timing — future work
-    std::cout << "  Note: real layer has 2x K4 (Q+K). Shown: 1x K4 + 1x K1 + 1x K0 + 1x K2" << std::endl;
+    auto bare_sA_mh = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideA{}, make_shape(M, H, L));
+    auto bare_sB_hh = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideB{}, make_shape(H, H, L));
+    auto bare_sD_mh = cutlass::make_cute_packed_stride(
+      BareGemm::StrideD{}, make_shape(M, H, L));
+    auto bare_sB_ffn = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideB{}, make_shape(N_ffn, H, L));
+    auto bare_sD_ffn = cutlass::make_cute_packed_stride(
+      BareGemm::StrideD{}, make_shape(M, N_ffn, L));
+
+    typename BareKernel::Arguments args_qk{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+      {x.get(), bare_sA_mh, W_qk.get(), bare_sB_hh},
+      {{1.0f, 0.0f}, nullptr, bare_sD_mh, tmp_buf.get(), bare_sD_mh},
+      hw_info};
+    typename BareKernel::Arguments args_v{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+      {x.get(), bare_sA_mh, W_v.get(), bare_sB_hh},
+      {{1.0f, 0.0f}, nullptr, bare_sD_mh, V_out.get(), bare_sD_mh},
+      hw_info};
+    typename BareKernel::Arguments args_o{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+      {V_out.get(), bare_sA_mh, W_o.get(), bare_sB_hh},
+      {{1.0f, 0.0f}, nullptr, bare_sD_mh, residual1.get(), bare_sD_mh},
+      hw_info};
+    typename BareKernel::Arguments args_ffn{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, N_ffn, H, L},
+      {residual1.get(), bare_sA_mh, W_ffn.get(), bare_sB_ffn},
+      {{1.0f, 0.0f}, nullptr, bare_sD_ffn, ffn_out.get(), bare_sD_ffn},
+      hw_info};
+
+    BareOp bare_qk, bare_v, bare_o, bare_ffn;
+    cutlass::device_memory::allocation<uint8_t> ws_qk(BareOp::get_workspace_size(args_qk));
+    cutlass::device_memory::allocation<uint8_t> ws_v(BareOp::get_workspace_size(args_v));
+    cutlass::device_memory::allocation<uint8_t> ws_o(BareOp::get_workspace_size(args_o));
+    cutlass::device_memory::allocation<uint8_t> ws_ffn(BareOp::get_workspace_size(args_ffn));
+    CUTLASS_CHECK(bare_qk.can_implement(args_qk));
+    CUTLASS_CHECK(bare_qk.initialize(args_qk, ws_qk.get()));
+    CUTLASS_CHECK(bare_v.can_implement(args_v));
+    CUTLASS_CHECK(bare_v.initialize(args_v, ws_v.get()));
+    CUTLASS_CHECK(bare_o.can_implement(args_o));
+    CUTLASS_CHECK(bare_o.initialize(args_o, ws_o.get()));
+    CUTLASS_CHECK(bare_ffn.can_implement(args_ffn));
+    CUTLASS_CHECK(bare_ffn.initialize(args_ffn, ws_ffn.get()));
+
+    size_t mh_bytes = mh * sizeof(bf16);
+
+    // Warm-up unfused
+    xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+    bare_qk.run();
+    xe_fuse::standalone::scale_rows(q, tmp_buf.get(), R1.get(), M, H, L);
+    xe_fuse::standalone::rope(q, Q_out.get(), tmp_buf.get(), cos_sin.get(), M, H, L);
+    bare_v.run();
+    xe_fuse::standalone::scale_rows(q, V_out.get(), R1.get(), M, H, L);
+    bare_o.run();
+    xe_fuse::standalone::add_residual(q, residual1.get(), x.get(), M, H, L);
+    q.memcpy(raw_sum.get(), residual1.get(), mh_bytes);
+    xe_fuse::standalone::scale_cols(q, residual1.get(), gamma.get(), M, H, L);
+    xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+    bare_ffn.run();
+    xe_fuse::standalone::scale_rows(q, ffn_out.get(), R2.get(), M, N_ffn, L);
+    xe_fuse::standalone::swiglu(q, ffn_out.get(), M, N_ffn, L);
+    compat::wait();
+
+    timer.start();
+    for (int i = 0; i < opts.iterations; ++i) {
+      xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+      bare_qk.run();
+      xe_fuse::standalone::scale_rows(q, tmp_buf.get(), R1.get(), M, H, L);
+      xe_fuse::standalone::rope(q, Q_out.get(), tmp_buf.get(), cos_sin.get(), M, H, L);
+      bare_v.run();
+      xe_fuse::standalone::scale_rows(q, V_out.get(), R1.get(), M, H, L);
+      bare_o.run();
+      xe_fuse::standalone::add_residual(q, residual1.get(), x.get(), M, H, L);
+      q.memcpy(raw_sum.get(), residual1.get(), mh_bytes);
+      xe_fuse::standalone::scale_cols(q, residual1.get(), gamma.get(), M, H, L);
+      xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+      bare_ffn.run();
+      xe_fuse::standalone::scale_rows(q, ffn_out.get(), R2.get(), M, N_ffn, L);
+      xe_fuse::standalone::swiglu(q, ffn_out.get(), M, N_ffn, L);
+    }
+    compat::wait();
+    float unfused_s = timer.seconds() / opts.iterations;
+
+    printf("\nUnfused pipeline (bare GEMM + standalone ops):\n");
+    printf("  Time: %.4f ms\n", unfused_s * 1000);
+    printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / unfused_s);
+
+    float speedup = unfused_s / fused_s;
+    float savings = (1.0f - fused_s / unfused_s) * 100.0f;
+    printf("\nFusion speedup: %.2fx (fused saves %.1f%% of pipeline time)\n", speedup, savings);
+    std::cout << "Note: real layer has 2x K4 (Q+K). Shown: 1x K4 + 1x K1 + 1x K0 + 1x K2" << std::endl;
   }
 
   return all_passed ? 0 : 1;
