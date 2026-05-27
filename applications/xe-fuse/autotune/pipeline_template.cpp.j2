@@ -12,6 +12,7 @@
 #include "xe-fuse/kernels/gemm_dual_output.hpp"
 #include "xe-fuse/kernels/compute_rstd.hpp"
 #include "xe-fuse/standalone/ops.hpp"
+#include "xe-fuse/standalone/vllm_ops.hpp"
 {% if use_rope %}
 #include "xe-fuse/kernels/gemm_rmsnorm_rope.hpp"
 {% endif %}
@@ -514,6 +515,167 @@ int main(int argc, const char** argv) {
     printf("  Time: %.4f ms\n", fused_s * 1000);
     printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / fused_s);
 
+    // --- vllm-equiv pipeline ---
+    // Uses the same bare GEMM from sycl-tla but with vllm-style fused
+    // standalone kernels between GEMMs (fused_add_rms_norm, silu_and_mul, etc.)
+    // This isolates the fusion strategy difference: INTO epilogue vs BETWEEN GEMMs.
+    float vllm_s = 0.0f;
+    {
+      using BareOp = typename BareGemm::Gemm;
+      using BareKernel = typename BareGemm::Gemm::GemmKernel;
+
+      auto bare_sA_mh = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideA{}, make_shape(M, H, L));
+      auto bare_sB_hh = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideB{}, make_shape(H, H, L));
+      auto bare_sD_mh = cutlass::make_cute_packed_stride(
+        BareGemm::StrideD{}, make_shape(M, H, L));
+      auto bare_sB_hkv = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideB{}, make_shape(H_kv, H, L));
+      auto bare_sD_hkv = cutlass::make_cute_packed_stride(
+        BareGemm::StrideD{}, make_shape(M, H_kv, L));
+      auto bare_sB_ffn = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideB{}, make_shape(N_ffn, H, L));
+      auto bare_sD_ffn = cutlass::make_cute_packed_stride(
+        BareGemm::StrideD{}, make_shape(M, N_ffn, L));
+
+      // vllm needs RMSNorm weight vectors (bf16, matches vllm convention)
+      cutlass::DeviceAllocation<bf16> norm_weight1(static_cast<size_t>(H));
+      cutlass::DeviceAllocation<bf16> norm_weight2(static_cast<size_t>(H));
+      {
+        std::vector<bf16> hw(H);
+        std::mt19937 rng(99);
+        std::uniform_real_distribution<float> dist(0.8f, 1.2f);
+        for (auto& v : hw) v = static_cast<bf16>(dist(rng));
+        q.memcpy(norm_weight1.get(), hw.data(), hw.size() * sizeof(bf16));
+        q.memcpy(norm_weight2.get(), hw.data(), hw.size() * sizeof(bf16));
+        compat::wait();
+      }
+
+      // Q GEMM: x @ W_q -> tmp_buf [M, H]
+      typename BareKernel::Arguments vq_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+        {x.get(), bare_sA_mh, W_q.get(), bare_sB_hh},
+        { {1.0f, 0.0f}, nullptr, bare_sD_mh, tmp_buf.get(), bare_sD_mh},
+        hw_info};
+      // V GEMM: x @ W_v -> V_out [M, H_kv]
+      typename BareKernel::Arguments vv_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, H_kv, H, L},
+        {x.get(), bare_sA_mh, W_v.get(), bare_sB_hkv},
+        { {1.0f, 0.0f}, nullptr, bare_sD_hkv, V_out.get(), bare_sD_hkv},
+        hw_info};
+      // O GEMM: attn_out @ W_o -> residual1 [M, H]
+      typename BareKernel::Arguments vo_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+        {attn_out.get(), bare_sA_mh, W_o.get(), bare_sB_hh},
+        { {1.0f, 0.0f}, nullptr, bare_sD_mh, residual1.get(), bare_sD_mh},
+        hw_info};
+      // FFN GEMM: input @ W_ffn -> ffn_out [M, N_ffn]
+      typename BareKernel::Arguments vffn_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N_ffn, H, L},
+        {residual1.get(), bare_sA_mh, W_ffn.get(), bare_sB_ffn},
+        { {1.0f, 0.0f}, nullptr, bare_sD_ffn, ffn_out.get(), bare_sD_ffn},
+        hw_info};
+
+      BareOp vq_op, vv_op, vo_op, vffn_op;
+      cutlass::device_memory::allocation<uint8_t> ws_vq(BareOp::get_workspace_size(vq_args));
+      cutlass::device_memory::allocation<uint8_t> ws_vv(BareOp::get_workspace_size(vv_args));
+      cutlass::device_memory::allocation<uint8_t> ws_vo(BareOp::get_workspace_size(vo_args));
+      cutlass::device_memory::allocation<uint8_t> ws_vffn(BareOp::get_workspace_size(vffn_args));
+      CUTLASS_CHECK(vq_op.can_implement(vq_args));
+      CUTLASS_CHECK(vq_op.initialize(vq_args, ws_vq.get()));
+      CUTLASS_CHECK(vv_op.can_implement(vv_args));
+      CUTLASS_CHECK(vv_op.initialize(vv_args, ws_vv.get()));
+      CUTLASS_CHECK(vo_op.can_implement(vo_args));
+      CUTLASS_CHECK(vo_op.initialize(vo_args, ws_vo.get()));
+      CUTLASS_CHECK(vffn_op.can_implement(vffn_args));
+      CUTLASS_CHECK(vffn_op.initialize(vffn_args, ws_vffn.get()));
+
+      // cos_sin cache for vllm RoPE: [M, rot_dim] with cos in first half, sin in second
+{% if use_rope %}
+      int head_dim = 128;
+      int num_q_heads = H / head_dim;
+      int num_kv_heads_rope = H_kv / head_dim;
+      int rot_dim = head_dim;
+      cutlass::DeviceAllocation<float> vllm_cos_sin(static_cast<size_t>(M) * rot_dim);
+      {
+        std::vector<float> hcs(static_cast<size_t>(M) * rot_dim);
+        std::mt19937 rng(2024);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& v : hcs) v = dist(rng);
+        q.memcpy(vllm_cos_sin.get(), hcs.data(), hcs.size() * sizeof(float));
+        compat::wait();
+      }
+{% endif %}
+
+      // Warmup
+      xe_fuse::vllm_equiv::rms_norm(q, tmp_buf.get(), x.get(), norm_weight1.get(), M, H, opts.eps);
+      compat::wait();
+      CUTLASS_CHECK(vq_op.run());
+      compat::wait();
+{% if use_rope %}
+      xe_fuse::vllm_equiv::rotary_embedding(q, tmp_buf.get(), nullptr,
+        vllm_cos_sin.get(), head_dim, num_q_heads, num_kv_heads_rope, rot_dim, M);
+{% endif %}
+      CUTLASS_CHECK(vv_op.run());
+      compat::wait();
+      xe_fuse::vllm_equiv::rms_norm(q, V_out.get(), V_out.get(), norm_weight1.get(), M, H_kv, opts.eps);
+      compat::wait();
+      CUTLASS_CHECK(vo_op.run());
+      compat::wait();
+      xe_fuse::vllm_equiv::fused_add_rms_norm(q, residual1.get(), x.get(),
+        norm_weight2.get(), M, H, opts.eps);
+      compat::wait();
+      CUTLASS_CHECK(vffn_op.run());
+      compat::wait();
+{% if ffn_activation == "swiglu" %}
+      xe_fuse::vllm_equiv::silu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% elif ffn_activation == "geglu" %}
+      xe_fuse::vllm_equiv::gelu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% endif %}
+      compat::wait();
+
+      // Timed loop
+      timer.start();
+      for (int i = 0; i < opts.iterations; ++i) {
+        // RMSNorm on input (pre-Q/V)
+        xe_fuse::vllm_equiv::rms_norm(q, tmp_buf.get(), x.get(), norm_weight1.get(), M, H, opts.eps);
+        // Q projection
+        CUTLASS_CHECK(vq_op.run());
+{% if use_rope %}
+        // RoPE on Q (NeoX-style, head_dim=128)
+        xe_fuse::vllm_equiv::rotary_embedding(q, tmp_buf.get(), nullptr,
+          vllm_cos_sin.get(), head_dim, num_q_heads, num_kv_heads_rope, rot_dim, M);
+{% endif %}
+        // V projection
+        CUTLASS_CHECK(vv_op.run());
+        // RMSNorm on V
+        xe_fuse::vllm_equiv::rms_norm(q, V_out.get(), V_out.get(), norm_weight1.get(), M, H_kv, opts.eps);
+        // O projection
+        CUTLASS_CHECK(vo_op.run());
+        // fused_add_rms_norm: residual add + RMSNorm for FFN input
+        xe_fuse::vllm_equiv::fused_add_rms_norm(q, residual1.get(), x.get(),
+          norm_weight2.get(), M, H, opts.eps);
+        // FFN GEMM
+        CUTLASS_CHECK(vffn_op.run());
+        // silu_and_mul / gelu_and_mul (contiguous halves -> half-width output)
+{% if ffn_activation == "swiglu" %}
+        xe_fuse::vllm_equiv::silu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% elif ffn_activation == "geglu" %}
+        xe_fuse::vllm_equiv::gelu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% elif ffn_activation == "gelu" %}
+        xe_fuse::standalone::gelu(q, ffn_out.get(), M, N_ffn, L);
+{% endif %}
+      }
+      compat::wait();
+      vllm_s = timer.seconds() / opts.iterations;
+
+      printf("\nvllm-equiv pipeline (bare GEMM + fused standalone ops):\n");
+      printf("  Time: %.4f ms\n", vllm_s * 1000);
+      printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / vllm_s);
+      printf("  Ops: rms_norm + GEMM + RoPE + GEMM + rms_norm + GEMM + fused_add_rms_norm + GEMM + {{ ffn_activation }}\n");
+    }
+
     // --- Unfused pipeline ---
     using BareOp = typename BareGemm::Gemm;
     using BareKernel = typename BareGemm::Gemm::GemmKernel;
@@ -633,7 +795,7 @@ int main(int argc, const char** argv) {
 
     float speedup = unfused_s / fused_s;
     float savings = (1.0f - fused_s / unfused_s) * 100.0f;
-    printf("\nFusion speedup: %.2fx (fused saves %.1f%% of pipeline time)\n", speedup, savings);
+    printf("\nFusion speedup vs naive: %.2fx (fused saves %.1f%% of pipeline time)\n", speedup, savings);
     std::cout << "Note: K projection omitted (same kernel as Q)" << std::endl;
 
     // Structured output for LLM agent parsing
@@ -643,9 +805,11 @@ int main(int argc, const char** argv) {
     printf("DIMS: M=%d H=%d H_kv=%d I=%d N_ffn=%d\n", M, H, H_kv, I, N_ffn);
     std::cout << "CORRECTNESS: " << (all_passed ? "ALL_PASSED" : "SOME_FAILED") << std::endl;
     printf("FUSED: %.4f ms %.3f TFlop/s\n", fused_s * 1000, flops * 1e-12 / fused_s);
+    printf("VLLM_EQUIV: %.4f ms %.3f TFlop/s\n", vllm_s * 1000, flops * 1e-12 / vllm_s);
     printf("UNFUSED: %.4f ms %.3f TFlop/s\n", unfused_s * 1000, flops * 1e-12 / unfused_s);
-    printf("SPEEDUP: %.2fx\n", speedup);
-    printf("SAVINGS: %.1f%%\n", savings);
+    printf("XE_VS_VLLM: %.2fx\n", vllm_s / fused_s);
+    printf("XE_VS_NAIVE: %.2fx\n", speedup);
+    printf("VLLM_VS_NAIVE: %.2fx\n", unfused_s / vllm_s);
     std::cout << "GEMMS: Q({{ 'K4' if use_rope else 'K1' }}) V(K1) O(K0) FFN({{ ffn_activation }})" << std::endl;
     std::cout << "NOTE: K projection omitted (same kernel as Q)" << std::endl;
   }
