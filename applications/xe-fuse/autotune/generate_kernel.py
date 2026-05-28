@@ -226,13 +226,162 @@ PRESETS = {
             "typename xe_fuse::XePairwiseCompute<xe_fuse::GeGLUFn>::Arguments geglu_args{};",
             "typename EVT::Arguments evt_args{rms_args, geglu_args};"
         ]
+    },
+    "k1v2": {
+        "name": "K1v2_ScaleRowsMerged",
+        "evt_description": "D = acc * R[m] via merged visitor (flat tree)",
+        "tile_shape": "_256, _256, _32",
+        "evt_typedefs": "using EVT = b::ScaleRowsMerged<TileShape, float>;",
+        "aux_data": [
+            {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
+        ],
+        "evt_args": [
+            "// child 0: ColBroadcast<R>",
+            "typename b::ColBroadcast<0, TileShape, float>::Arguments scale_args;",
+            "scale_args.ptr_col = block_scale.get();",
+            "scale_args.null_default = float(1);",
+            "scale_args.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};",
+            "",
+            "// root: XeScaleRowsCompute (merged)",
+            "typename xe_fuse::XeScaleRowsCompute::Arguments visitor_args{};",
+            "",
+            "typename EVT::Arguments evt_args{scale_args, visitor_args};"
+        ]
+    },
+    "k2v2": {
+        "name": "K2v2_SwiGLUScaled",
+        "evt_description": "D = SwiGLU(acc * R[m]) via merged visitor (flat tree)",
+        "tile_shape": "_256, _256, _32",
+        "evt_typedefs": "using EVT = b::SwiGLUScaled<TileShape, float>;",
+        "aux_data": [
+            {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
+        ],
+        "evt_args": [
+            "// child 0: ColBroadcast<R>",
+            "typename b::ColBroadcast<0, TileShape, float>::Arguments scale_args;",
+            "scale_args.ptr_col = block_scale.get();",
+            "scale_args.null_default = float(1);",
+            "scale_args.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};",
+            "",
+            "// root: XeScaleRowsSwiGLUCompute (merged)",
+            "typename xe_fuse::XeScaleRowsSwiGLUCompute::Arguments visitor_args{};",
+            "",
+            "typename EVT::Arguments evt_args{scale_args, visitor_args};"
+        ]
+    },
+    "k2v2_geglu": {
+        "name": "K2v2_GeGLUScaled",
+        "evt_description": "D = GeGLU(acc * R[m]) via merged visitor (flat tree)",
+        "tile_shape": "_256, _256, _32",
+        "evt_typedefs": "using EVT = b::GeGLUScaled<TileShape, float>;",
+        "aux_data": [
+            {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
+        ],
+        "evt_args": [
+            "// child 0: ColBroadcast<R>",
+            "typename b::ColBroadcast<0, TileShape, float>::Arguments scale_args;",
+            "scale_args.ptr_col = block_scale.get();",
+            "scale_args.null_default = float(1);",
+            "scale_args.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};",
+            "",
+            "// root: XeScaleRowsGeGLUCompute (merged)",
+            "typename xe_fuse::XeScaleRowsGeGLUCompute::Arguments visitor_args{};",
+            "",
+            "typename EVT::Arguments evt_args{scale_args, visitor_args};"
+        ]
+    },
+    "w8a8_dequant": {
+        "name": "W8A8_Dequant",
+        "evt_description": "D_bf16 = int32_acc * scale_token[m] * scale_channel[n]",
+        "tile_shape": "_256, _256, _32",
+        "element_a": "int8_t",
+        "element_b": "int8_t",
+        "element_d": "bf16",
+        "element_acc": "int32_t",
+        "element_compute": "float",
+        "alignment_ab": 32,
+        "alignment_cd": 8,
+        "evt_typedefs": "using EVT = b::DequantW8A8<TileShape, float, float>;",
+        "aux_data": [
+            {"name": "scale_token", "type": "float", "shape": "M * L", "init_seed": 42},
+            {"name": "scale_channel", "type": "float", "shape": "N * L", "init_seed": 99}
+        ],
+        "evt_args": [
+            "// Inner Mul: Acc * scale_token[m] (ColBroadcast, Idx=0)",
+            "typename b::Acc::Arguments accum_args{};",
+            "typename b::ColBroadcast<0, TileShape, float>::Arguments token_args;",
+            "token_args.ptr_col = block_scale_token.get();",
+            "token_args.null_default = float(1);",
+            "token_args.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};",
+            "typename b::MulOp<>::Arguments inner_mul_args{};",
+            "",
+            "// Outer Mul: (acc * scale_token) * scale_channel[n] (RowBroadcast, Idx=1)",
+            "typename b::RowBroadcast<1, TileShape, float>::Arguments channel_args;",
+            "channel_args.ptr_row = block_scale_channel.get();",
+            "channel_args.null_default = float(1);",
+            "channel_args.dRow = {cute::Int<0>{}, cute::Int<1>{}, static_cast<int64_t>(N)};",
+            "typename b::MulOp<>::Arguments outer_mul_args{};",
+            "",
+            "// Compose: EVT = Mul(Mul(Acc, ColBcast), RowBcast)",
+            "using InnerMul = b::Mul<b::Acc, b::ColBroadcast<0, TileShape, float>>;",
+            "typename InnerMul::Arguments inner_args{accum_args, token_args, inner_mul_args};",
+            "typename EVT::Arguments evt_args{inner_args, channel_args, outer_mul_args};"
+        ]
+    },
+    "w8a8_dequant_biased": {
+        "name": "W8A8_DequantBiased",
+        "evt_description": "D_bf16 = int32_acc * scale_token[m] * scale_channel[n] + bias[n]",
+        "tile_shape": "_256, _256, _32",
+        "element_a": "int8_t",
+        "element_b": "int8_t",
+        "element_d": "bf16",
+        "element_acc": "int32_t",
+        "element_compute": "float",
+        "alignment_ab": 32,
+        "alignment_cd": 8,
+        "evt_typedefs": "using EVT = b::DequantW8A8Biased<TileShape, float, float, float>;",
+        "aux_data": [
+            {"name": "scale_token", "type": "float", "shape": "M * L", "init_seed": 42},
+            {"name": "scale_channel", "type": "float", "shape": "N * L", "init_seed": 99},
+            {"name": "bias", "type": "float", "shape": "N * L", "init_seed": 77}
+        ],
+        "evt_args": [
+            "// Inner Mul: Acc * scale_token[m] (ColBroadcast, Idx=0)",
+            "typename b::Acc::Arguments accum_args{};",
+            "typename b::ColBroadcast<0, TileShape, float>::Arguments token_args;",
+            "token_args.ptr_col = block_scale_token.get();",
+            "token_args.null_default = float(1);",
+            "token_args.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};",
+            "typename b::MulOp<>::Arguments inner_mul_args{};",
+            "",
+            "// Middle Mul: (acc * scale_token) * scale_channel[n] (RowBroadcast, Idx=1)",
+            "typename b::RowBroadcast<1, TileShape, float>::Arguments channel_args;",
+            "channel_args.ptr_row = block_scale_channel.get();",
+            "channel_args.null_default = float(1);",
+            "channel_args.dRow = {cute::Int<0>{}, cute::Int<1>{}, static_cast<int64_t>(N)};",
+            "typename b::MulOp<>::Arguments mid_mul_args{};",
+            "",
+            "// Outer Add: dequant + bias[n] (RowBroadcast, Idx=2)",
+            "typename b::RowBroadcast<2, TileShape, float>::Arguments bias_args;",
+            "bias_args.ptr_row = block_bias.get();",
+            "bias_args.null_default = float(0);",
+            "bias_args.dRow = {cute::Int<0>{}, cute::Int<1>{}, static_cast<int64_t>(N)};",
+            "typename b::AddOp<>::Arguments add_args{};",
+            "",
+            "// Compose: EVT = Add(Mul(Mul(Acc, ColBcast), RowBcast), RowBcast_bias)",
+            "using InnerMul = b::Mul<b::Acc, b::ColBroadcast<0, TileShape, float>>;",
+            "using DequantMul = b::DequantW8A8<TileShape, float, float>;",
+            "typename InnerMul::Arguments inner_args{accum_args, token_args, inner_mul_args};",
+            "typename DequantMul::Arguments dequant_args{inner_args, channel_args, mid_mul_args};",
+            "typename EVT::Arguments evt_args{dequant_args, bias_args, add_args};"
+        ]
     }
 }
 
 
 def generate_aux_allocations(aux_data: list[dict]) -> str:
     lines = []
-    type_map = {"float": "float", "bf16": "bf16"}
+    type_map = {"float": "float", "bf16": "bf16", "int8": "int8_t", "int32": "int32_t"}
     for aux in aux_data:
         ctype = type_map.get(aux["type"], aux["type"])
         name = aux["name"]
@@ -252,6 +401,19 @@ def generate_cpp(spec: dict, defaults: dict | None = None) -> str:
             from jinja2 import Template
             with open(template_path) as f:
                 tmpl = Template(f.read())
+
+            elem_a = spec.get("element_a", "bf16")
+            elem_b = spec.get("element_b", "bf16")
+            elem_d = spec.get("element_d", "bf16")
+            elem_acc = spec.get("element_acc", "float")
+            elem_compute = spec.get("element_compute", "float")
+            align_ab = spec.get("alignment_ab", 8)
+            align_cd = spec.get("alignment_cd", 8)
+            make_gemm_extra = ""
+            if align_ab != 8 or align_cd != 8:
+                make_gemm_extra = (f",\n    cutlass::layout::RowMajor, cutlass::layout::RowMajor, "
+                                   f"{align_ab}, {align_cd}")
+
             return tmpl.render(
                 kernel_name=spec["name"],
                 timestamp=datetime.now().isoformat(),
@@ -266,6 +428,12 @@ def generate_cpp(spec: dict, defaults: dict | None = None) -> str:
                 default_iterations=defaults.get("iterations", 200),
                 default_verify=defaults.get("verify", 0),
                 has_verify=False,
+                element_a=elem_a,
+                element_b=elem_b,
+                element_d=elem_d,
+                element_acc=elem_acc,
+                element_compute=elem_compute,
+                make_gemm_extra=make_gemm_extra,
             )
         except ImportError:
             pass
@@ -284,6 +452,21 @@ def generate_cpp_inline(spec: dict, defaults: dict | None = None) -> str:
 
     aux_alloc = generate_aux_allocations(spec.get("aux_data", []))
     evt_args_code = "  " + "\n  ".join(spec.get("evt_args", []))
+
+    # Element types and alignments (with backward-compatible defaults)
+    elem_a = spec.get("element_a", "bf16")
+    elem_b = spec.get("element_b", "bf16")
+    elem_d = spec.get("element_d", "bf16")
+    elem_acc = spec.get("element_acc", "float")
+    elem_compute = spec.get("element_compute", "float")
+    align_ab = spec.get("alignment_ab", 8)
+    align_cd = spec.get("alignment_cd", 8)
+
+    # MakeGemm template args beyond the 7 positional defaults
+    make_gemm_extra = ""
+    if align_ab != 8 or align_cd != 8:
+        make_gemm_extra = (f",\n    cutlass::layout::RowMajor, cutlass::layout::RowMajor, "
+                           f"{align_ab}, {align_cd}")
 
     return f"""\
 // Auto-generated xe-fuse kernel benchmark
@@ -312,7 +495,7 @@ using TileShape = Shape<{spec.get("tile_shape", "_256, _256, _32")}>;
 // ---- EVT tree ----
 {spec["evt_typedefs"]}
 
-using KernelConfig = b::MakeGemm<EVT, bf16, bf16, bf16, float, float, TileShape>;
+using KernelConfig = b::MakeGemm<EVT, {elem_a}, {elem_b}, {elem_d}, {elem_acc}, {elem_compute}, TileShape{make_gemm_extra}>;
 using GemmOp = typename KernelConfig::Gemm;
 
 struct Options {{
@@ -348,9 +531,9 @@ int main(int argc, const char** argv) {{
   auto stride_C = cutlass::make_cute_packed_stride(KernelConfig::StrideC{{}}, make_shape(M, N, L));
   auto stride_D = cutlass::make_cute_packed_stride(KernelConfig::StrideD{{}}, make_shape(M, N, L));
 
-  cutlass::DeviceAllocation<bf16> block_A(static_cast<size_t>(M) * K * L);
-  cutlass::DeviceAllocation<bf16> block_B(static_cast<size_t>(K) * N * L);
-  cutlass::DeviceAllocation<bf16> block_D(static_cast<size_t>(M) * N * L);
+  cutlass::DeviceAllocation<{elem_a}> block_A(static_cast<size_t>(M) * K * L);
+  cutlass::DeviceAllocation<{elem_b}> block_B(static_cast<size_t>(K) * N * L);
+  cutlass::DeviceAllocation<{elem_d}> block_D(static_cast<size_t>(M) * N * L);
 
   initialize_block(block_A, 2023);
   initialize_block(block_B, 2022);

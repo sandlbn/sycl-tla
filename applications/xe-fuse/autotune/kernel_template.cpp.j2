@@ -30,7 +30,7 @@ using TileShape = Shape<{{ tile_shape }}>;
 {{ evt_typedefs }}
 
 // ---- Kernel assembly ----
-using KernelConfig = b::MakeGemm<EVT, bf16, bf16, bf16, float, float, TileShape>;
+using KernelConfig = b::MakeGemm<EVT, {{ element_a }}, {{ element_b }}, {{ element_d }}, {{ element_acc }}, {{ element_compute }}, TileShape{{ make_gemm_extra }}>;
 using GemmOp = typename KernelConfig::Gemm;
 
 struct Options {
@@ -67,9 +67,9 @@ int main(int argc, const char** argv) {
   auto stride_D = cutlass::make_cute_packed_stride(KernelConfig::StrideD{}, make_shape(M, N, L));
 
   // Allocate matrices
-  cutlass::DeviceAllocation<bf16> block_A(static_cast<size_t>(M) * K * L);
-  cutlass::DeviceAllocation<bf16> block_B(static_cast<size_t>(K) * N * L);
-  cutlass::DeviceAllocation<bf16> block_D(static_cast<size_t>(M) * N * L);
+  cutlass::DeviceAllocation<{{ element_a }}> block_A(static_cast<size_t>(M) * K * L);
+  cutlass::DeviceAllocation<{{ element_b }}> block_B(static_cast<size_t>(K) * N * L);
+  cutlass::DeviceAllocation<{{ element_d }}> block_D(static_cast<size_t>(M) * N * L);
 
   initialize_block(block_A, 2023);
   initialize_block(block_B, 2022);

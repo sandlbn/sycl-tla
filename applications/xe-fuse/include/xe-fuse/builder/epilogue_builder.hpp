@@ -45,6 +45,7 @@
 #include "xe-fuse/visitors/xe_elementwise_compute.hpp"
 #include "xe-fuse/visitors/xe_pairwise_compute.hpp"
 #include "xe-fuse/visitors/xe_rope_compute.hpp"
+#include "xe-fuse/visitors/xe_scalerows_compute.hpp"
 
 namespace xe_fuse::builder {
 
@@ -63,20 +64,22 @@ using AuxLoad = cutlass::epilogue::fusion::XeAuxLoad<
     Element, Stride, void, VecWidth, true, true>;
 
 // Per-column vector broadcast: scale[m] replicated across N columns
+// Idx is kept for API consistency but always maps to Stages=0 (no smem pipelining on Xe)
 template <int Idx, typename TileShape, typename Element,
           typename ElementCompute = float,
           int VecWidth = 128 / cutlass::sizeof_bits_v<Element>>
 using ColBroadcast = cutlass::epilogue::fusion::XeColBroadcast<
-    Idx, TileShape, Element, ElementCompute,
+    0, TileShape, Element, ElementCompute,
     cute::Stride<cute::Int<1>, cute::Int<0>, int64_t>,
     VecWidth>;
 
 // Per-row vector broadcast: scale[n] replicated across M rows
+// Idx is kept for API consistency but always maps to Stages=0 (no smem pipelining on Xe)
 template <int Idx, typename TileShape, typename Element,
           typename ElementCompute = float,
           int VecWidth = 128 / cutlass::sizeof_bits_v<Element>>
 using RowBroadcast = cutlass::epilogue::fusion::XeRowBroadcast<
-    Idx, TileShape, Element, ElementCompute,
+    0, TileShape, Element, ElementCompute,
     cute::Stride<cute::Int<0>, cute::Int<1>, int64_t>,
     VecWidth>;
 
@@ -172,6 +175,28 @@ using RoPEScaled = EVT<XeRoPEScaledCompute,
     AuxLoad<ElementCosSin>>;
 
 // ============================================================
+// Merged Visitors — flat trees with fewer register spills
+// ============================================================
+
+// ScaleRowsMerged: acc * R[m] in a single visitor (merged K1v2)
+// Flat tree: reads frg_acc directly, no AccFetch or MulCompute nodes
+template <typename TileShape, typename ElementScale = float>
+using ScaleRowsMerged = EVT<XeScaleRowsCompute,
+    ColBroadcast<0, TileShape, ElementScale>>;
+
+// SwiGLUScaled: SwiGLU(acc * R[m]) in a single visitor (merged K2v2)
+// Flat tree: scale + shuffle + silu(gate)*up in one visit() call
+template <typename TileShape, typename ElementScale = float>
+using SwiGLUScaled = EVT<XeScaleRowsSwiGLUCompute,
+    ColBroadcast<0, TileShape, ElementScale>>;
+
+// GeGLUScaled: GeGLU(acc * R[m]) in a single visitor (merged K2_geglu_v2)
+// Same as SwiGLUScaled but with GeLU activation
+template <typename TileShape, typename ElementScale = float>
+using GeGLUScaled = EVT<XeScaleRowsGeGLUCompute,
+    ColBroadcast<0, TileShape, ElementScale>>;
+
+// ============================================================
 // Activation Functions — element-wise unary operations
 // ============================================================
 
@@ -204,6 +229,32 @@ template <typename TileShape, typename ElementBias = float,
           typename ElementCompute = float>
 using BiasAdd = Add<Acc, RowBroadcast<0, TileShape, ElementBias, ElementCompute>,
                     ElementCompute, ElementCompute>;
+
+// ============================================================
+// Quantization — dequant/requant epilogues for INT8/FP8
+// ============================================================
+
+// DequantW8A8: int32_acc * scale_token[m] * scale_channel[n] → bf16
+// Per-token (ColBroadcast, Idx=0) × per-channel (RowBroadcast, Idx=1)
+// Standard W8A8 dequantization for INT8×INT8 GEMM in LLM inference
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCompute = float>
+using DequantW8A8 = Mul<
+    Mul<Acc,
+        ColBroadcast<0, TileShape, ElementScale, ElementCompute>,
+        ElementCompute, ElementCompute>,
+    RowBroadcast<1, TileShape, ElementScale, ElementCompute>,
+    ElementCompute, ElementCompute>;
+
+// DequantW8A8Biased: int32_acc * scale_token[m] * scale_channel[n] + bias[n] → bf16
+// Same as DequantW8A8 but adds a per-channel bias after dequantization
+template <typename TileShape,
+          typename ElementScale = float, typename ElementBias = float,
+          typename ElementCompute = float>
+using DequantW8A8Biased = Add<
+    DequantW8A8<TileShape, ElementScale, ElementCompute>,
+    RowBroadcast<2, TileShape, ElementBias, ElementCompute>,
+    ElementCompute, ElementCompute>;
 
 // ============================================================
 // Auxiliary Store — write intermediate results to a buffer

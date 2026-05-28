@@ -6,19 +6,6 @@ Fuses memory-bound Transformer operations (RMSNorm, SwiGLU, RoPE, GeLU, residual
 
 ## Quick Start
 
-### Run a full model pipeline
-
-```bash
-# Generate and benchmark a full Transformer layer for LLaMA 3 8B
-sbatch tests/run_model_pipeline.sh llama3_8b 2048 100
-
-# Or for Gemma 2 9B (uses GeGLU instead of SwiGLU)
-sbatch tests/run_model_pipeline.sh gemma2_9b 2048 100
-```
-
-The pipeline generator produces model-specific C++ from architecture presets,
-compiles it, and benchmarks fused vs unfused execution on real model dimensions.
-
 ### Using a preset kernel
 
 ```bash
@@ -49,6 +36,15 @@ GEMM epilogue presets:
   k2_geglu         D = GeGLU(acc * R[m])                   (RMSNorm + GeGLU)
   k3               D = RoPE(acc, cos_sin)                  (positional encoding)
   k4v2             D = RoPE(acc * R[m], cos_sin)           (RMSNorm + RoPE, merged)
+
+Merged visitors (flat tree, fewer register spills):
+  k1v2             D = acc * R[m]                          (merged ScaleRows)
+  k2v2             D = SwiGLU(acc * R[m])                  (merged scale + SwiGLU)
+  k2v2_geglu       D = GeGLU(acc * R[m])                   (merged scale + GeGLU)
+
+INT8 quantization epilogues:
+  w8a8_dequant         D_bf16 = int32_acc * scale_token[m] * scale_channel[n]
+  w8a8_dequant_biased  D_bf16 = ... + bias[n]
 
 Standalone presets (unfused baselines):
   sa_scale_rows     D[m,n] *= scale[m]
@@ -138,6 +134,27 @@ using Gemm = typename Kernel::Gemm;
 | `RoPEComposed<Input, ECosSin>` | RoPE on pre-processed input | Two-child visitor |
 | `RoPEScaled<TS, EScale, ECosSin>` | Merged scale + RoPE | Flat tree, fewer dispatches |
 
+### Quantization (INT8/W8A8)
+
+| Alias | Formula | Notes |
+|-------|---------|-------|
+| `DequantW8A8<TS, EScale>` | `int32_acc * scale_token[m] * scale_channel[n]` | INT8 GEMM → bf16 output |
+| `DequantW8A8Biased<TS, EScale, EBias>` | `... + bias[n]` | Same with per-channel bias |
+
+INT8 GEMM uses `int8_t` A/B inputs, `int32_t` accumulator, `bf16` output, and `AlignmentAB=32`
+for 256-bit INT8 loads via the `XE_8x16x32_S32S8S8S32_TT` MMA atom.
+
+### Merged Visitors (fewer register spills)
+
+| Alias | Formula | Notes |
+|-------|---------|-------|
+| `ScaleRowsMerged<TS, E>` | `acc * R[m]` in one visitor | Flat tree: no AccFetch/MulCompute nodes |
+| `SwiGLUScaled<TS, E>` | `SwiGLU(acc * R[m])` in one visitor | Scale + shuffle + silu(gate)*up |
+| `GeGLUScaled<TS, E>` | `GeGLU(acc * R[m])` in one visitor | Same with GeLU activation |
+
+These read `frg_acc` directly and do all math in one `visit()` call, eliminating
+intermediate `Array<float, FragmentSize>` temporaries and reducing register pressure.
+
 ### Patterns
 
 | Alias | Description |
@@ -147,9 +164,14 @@ using Gemm = typename Kernel::Gemm;
 ### Kernel Builder
 
 ```cpp
-// MakeGemm<EVT, ElementA, ElementB, ElementD, ElementAcc, ElementCompute, TileShape>
+// MakeGemm<EVT, ElementA, ElementB, ElementD, ElementAcc, ElementCompute, TileShape,
+//           LayoutA, LayoutB, AlignmentAB, AlignmentCD>
 using K = b::MakeGemm<EVT, bf16, bf16, bf16, float, float, TileShape>;
 using Gemm = typename K::Gemm;  // ready to instantiate and run
+
+// INT8 GEMM with custom alignment:
+using K = b::MakeGemm<EVT, int8_t, int8_t, bf16, int32_t, float, TileShape,
+                       cutlass::layout::RowMajor, cutlass::layout::RowMajor, 32, 8>;
 ```
 
 ## Composition Examples
@@ -176,6 +198,15 @@ using EVT = b::DualOutput<Input, Output, bf16>;
 using Step1 = b::AddResidual<bf16>;
 using Step2 = b::ScaleRows<Step1, TileShape, float>;
 using EVT = b::RoPEComposed<Step2, float>;
+
+// W8A8 INT8 dequantization: int8×int8 GEMM → bf16 with per-token/per-channel scales
+using EVT = b::DequantW8A8<TileShape, float>;
+using K = b::MakeGemm<EVT, int8_t, int8_t, bf16, int32_t, float, TileShape,
+                       cutlass::layout::RowMajor, cutlass::layout::RowMajor, 32, 8>;
+
+// Merged visitors (fewer register spills than composed equivalents):
+using EVT = b::ScaleRowsMerged<TileShape, float>;  // same as ScaleRows<Acc, ...> but flat
+using EVT = b::SwiGLUScaled<TileShape, float>;     // same as SwiGLU<ScaleRows<Acc, ...>> but flat
 ```
 
 ## Standalone Ops
@@ -221,7 +252,8 @@ xe-fuse/
 │   ├── visitors/
 │   │   ├── xe_elementwise_compute.hpp  — Unary ops: GeLU, SiLU, ReLU, Sigmoid
 │   │   ├── xe_pairwise_compute.hpp     — Pairwise: SwiGLU, GeGLU, generic pairs
-│   │   └── xe_rope_compute.hpp         — RoPE: 3 visitor variants
+│   │   ├── xe_rope_compute.hpp         — RoPE: 3 visitor variants
+│   │   └── xe_scalerows_compute.hpp    — Merged: ScaleRows, SwiGLUScaled, GeGLUScaled
 │   ├── kernels/                        — Complete GEMM+epilogue configs
 │   └── standalone/ops.hpp              — Element-wise SYCL baselines
 ├── autotune/

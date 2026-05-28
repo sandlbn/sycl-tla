@@ -822,38 +822,14 @@ struct XeRowBroadcast {
     ConsumerStoreCallbacks(MRow mRow_, CTensor tCcRow_, Params const& params_)
       : mRow(mRow_),
         tCcRow(tCcRow_),
-        params(params_),
-        tCrRow(make_fragment_like<ElementCompute>(tCcRow)) {  // Allocate register storage matching coordinate layout
-      if (EnableNullptr && params.ptr_row == nullptr) {
-        fill(tCrRow, params.null_default);
-      }
-    }
+        params(params_) { }
 
-    MRow mRow;                                                                         // Global bias tensor (M, N) - pointer already offset to correct batch
-    CTensor tCcRow;                                                                    // Global output coordinates per thread
-    decltype(make_fragment_like<ElementCompute>(tCcRow)) tCrRow;                     // Register cache: bias values pre-loaded in begin(), indexed same as tCcRow
+    MRow mRow;
+    CTensor tCcRow;
     Params const& params;
 
     CUTLASS_DEVICE void
-    begin() {
-      if (EnableNullptr && params.ptr_row == nullptr) {
-        return;
-      }
-      
-      // Load all bias values from global memory into registers once per epilogue tile.
-      // Subsequent visit() calls read from tCrRow
-      // Uses scalar loads indexed by global N coordinates from tCcRow
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(tCcRow); ++i) {
-        auto coord = tCcRow(i);
-        int n_coord = get<1>(coord);  // Extract global column index
-        if (n_coord < get<1>(shape(mRow))) {
-          tCrRow(i) = ElementCompute(mRow(_0{}, n_coord));  // mRow: stride_M=0 (broadcast), stride_N=1
-        } else {
-          tCrRow(i) = ElementCompute(0);  // Zero-pad out-of-bounds (for non-tile-aligned N)
-        }
-      }
-    }
+    begin() { }
 
     template <typename ElementAccumulator, int FragmentSize>
     CUTLASS_DEVICE Array<ElementCompute, FragmentSize>
@@ -868,14 +844,18 @@ struct XeRowBroadcast {
         return frg_row;
       }
 
-      // Read from pre-loaded register cache
-      // Slice tCrRow by epilogue iteration (epi_m, epi_n)
-      Tensor tCrRow_mn = tCrRow(_,_,_,epi_m,epi_n);
-      
+      Tensor tCcRow_mn = tCcRow(_,_,_,epi_m,epi_n);
+
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < FragmentSize; ++i) {
         int idx = epi_v * FragmentSize + i;
-        frg_row[i] = tCrRow_mn(idx);
+        auto coord = tCcRow_mn(idx);
+        int n_coord = get<1>(coord);
+        if (n_coord < get<1>(shape(mRow))) {
+          frg_row[i] = ElementCompute(mRow(_0{}, n_coord));
+        } else {
+          frg_row[i] = ElementCompute(0);
+        }
       }
 
       return frg_row;
@@ -1043,38 +1023,14 @@ struct XeColBroadcast {
     ConsumerStoreCallbacks(MCol mCol_, CTensor tCcCol_, Params const& params_)
       : mCol(mCol_),
         tCcCol(tCcCol_),
-        params(params_),
-        tCrCol(make_fragment_like<ElementCompute>(tCcCol)) {  // Allocate register storage matching coordinate layout
-      if (EnableNullptr && params.ptr_col == nullptr) {
-        fill(tCrCol, params.null_default);
-      }
-    }
+        params(params_) { }
 
-    MCol mCol;                                                                         // Global bias tensor (M, N) - pointer already offset to correct batch
-    CTensor tCcCol;                                                                    // Global output coordinates per thread
-    decltype(make_fragment_like<ElementCompute>(tCcCol)) tCrCol;                     // Register cache: bias values pre-loaded in begin(), indexed same as tCcCol
+    MCol mCol;
+    CTensor tCcCol;
     Params const& params;
 
     CUTLASS_DEVICE void
-    begin() {
-      if (EnableNullptr && params.ptr_col == nullptr) {
-        return;
-      }
-      
-      // Load all bias values from global memory into registers once per epilogue tile.
-      // Subsequent visit() calls read from tCrCol
-      // Uses scalar loads indexed by global M coordinates from tCcCol
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(tCcCol); ++i) {
-        auto coord = tCcCol(i);
-        int m_coord = get<0>(coord);  // Extract global row index
-        if (m_coord < get<0>(shape(mCol))) {
-          tCrCol(i) = ElementCompute(mCol(m_coord, _0{}));  // mCol: stride_M=1, stride_N=0 (broadcast)
-        } else {
-          tCrCol(i) = ElementCompute(0);  // Zero-pad out-of-bounds (for non-tile-aligned M)
-        }
-      }
-    }
+    begin() { }
 
     template <typename ElementAccumulator, int FragmentSize>
     CUTLASS_DEVICE Array<ElementCompute, FragmentSize>
@@ -1089,14 +1045,20 @@ struct XeColBroadcast {
         return frg_col;
       }
 
-      // Read from pre-loaded register cache
-      // Slice tCrCol by epilogue iteration (epi_m, epi_n)
-      Tensor tCrCol_mn = tCrCol(_,_,_,epi_m,epi_n);
-      
+      // Load directly from global memory per visit() — the scale vector is L1-cached.
+      // Eliminates the full-tile tCrCol register cache that caused spills at large tiles.
+      Tensor tCcCol_mn = tCcCol(_,_,_,epi_m,epi_n);
+
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < FragmentSize; ++i) {
         int idx = epi_v * FragmentSize + i;
-        frg_col[i] = tCrCol_mn(idx);
+        auto coord = tCcCol_mn(idx);
+        int m_coord = get<0>(coord);
+        if (m_coord < get<0>(shape(mCol))) {
+          frg_col[i] = ElementCompute(mCol(m_coord, _0{}));
+        } else {
+          frg_col[i] = ElementCompute(0);
+        }
       }
 
       return frg_col;
@@ -1746,9 +1708,16 @@ public:
       else                        { return right_inverse(args.tiled_copy.get_layoutD_TV()).with_shape(mn_shape); }
     }();                                                                                         // tile_mn -> tv_idx
 
+    // On Xe, the subgroup size is the lane width (not NumThreadsPerWarp which is 32 for CUDA)
+#if defined(SYCL_INTEL_TARGET)
+    static constexpr int LaneWidth = 16;
+#else
+    static constexpr int LaneWidth = NumThreadsPerWarp;
+#endif
+
     // Get the MN layout + coord of lanes to determine shuffle reduction iterations
-    using _W = Int<decltype(args.tiled_copy)::TiledNumThr::value / NumThreadsPerWarp>;
-    Layout tv2lane = Layout<Shape<Int<NumThreadsPerWarp>,_W,_1>,Stride<_1,_0,_0>>{};            //   tv_idx -> lane_idx
+    using _W = Int<decltype(args.tiled_copy)::TiledNumThr::value / LaneWidth>;
+    Layout tv2lane = Layout<Shape<Int<LaneWidth>,_W,_1>,Stride<_1,_0,_0>>{};                    //   tv_idx -> lane_idx
     Layout ref2lane = composition(tv2lane, ref_layout_MN);                                      //  tile_mn -> lane_idx
     Layout lane_layout_MN = make_layout(filter(get<0>(ref2lane)), filter(get<1>(ref2lane)));    //  lane_mn -> lane_idx
     Layout inv_lane_layout_MN = right_inverse(lane_layout_MN);                                  // lane_idx -> lane_mn
@@ -1756,11 +1725,11 @@ public:
     auto lane_mn = idx2crd(inv_lane_layout_MN(lane_idx), shape(lane_layout_MN));
 
     // Get the MN layout + coord of warps to determine smem reduction iterations
-    Layout tv2warp = Layout<Shape<Int<NumThreadsPerWarp>,_W,_1>,Stride<_0,_1,_0>>{};            //   tv_idx -> warp_idx
+    Layout tv2warp = Layout<Shape<Int<LaneWidth>,_W,_1>,Stride<_0,_1,_0>>{};                    //   tv_idx -> warp_idx
     Layout ref2warp = composition(tv2warp, ref_layout_MN);                                      //  tile_mn -> warp_idx
     Layout warp_layout_MN = make_layout(filter(get<0>(ref2warp)), filter(get<1>(ref2warp)));    //  warp_mn -> warp_idx
     Layout inv_warp_layout_MN = right_inverse(warp_layout_MN);                                  // warp_idx -> warp_mn
-    int warp_idx = args.thread_idx / NumThreadsPerWarp;
+    int warp_idx = args.thread_idx / LaneWidth;
     auto warp_mn = idx2crd(inv_warp_layout_MN(warp_idx), shape(warp_layout_MN));
 
     // Partition output gmem and register tensors
@@ -2338,9 +2307,16 @@ public:
       else                        { return right_inverse(args.tiled_copy.get_layoutD_TV()).with_shape(mn_shape); }
     }();                                                                                         // tile_mn -> tv_idx
 
+    // On Xe, the subgroup size is the lane width (not NumThreadsPerWarp which is 32 for CUDA)
+#if defined(SYCL_INTEL_TARGET)
+    static constexpr int LaneWidth = 16;
+#else
+    static constexpr int LaneWidth = NumThreadsPerWarp;
+#endif
+
     // Get the MN layout + coord of lanes to determine shuffle reduction iterations
-    using _W = Int<decltype(args.tiled_copy)::TiledNumThr::value / NumThreadsPerWarp>;
-    Layout tv2lane = Layout<Shape<Int<NumThreadsPerWarp>,_W,_1>,Stride<_1,_0,_0>>{};            //   tv_idx -> lane_idx
+    using _W = Int<decltype(args.tiled_copy)::TiledNumThr::value / LaneWidth>;
+    Layout tv2lane = Layout<Shape<Int<LaneWidth>,_W,_1>,Stride<_1,_0,_0>>{};                    //   tv_idx -> lane_idx
     Layout ref2lane = composition(tv2lane, ref_layout_MN);                                      //  tile_mn -> lane_idx
     Layout lane_layout_MN = make_layout(filter(get<0>(ref2lane)), filter(get<1>(ref2lane)));    //  lane_mn -> lane_idx
     Layout inv_lane_layout_MN = right_inverse(lane_layout_MN);                                  // lane_idx -> lane_mn
@@ -2348,12 +2324,12 @@ public:
     auto lane_mn = idx2crd(inv_lane_layout_MN(lane_idx), shape(lane_layout_MN));
 
     // Get the MN layout + coord of warps to determine smem reduction iterations
-    Layout tv2warp = Layout<Shape<Int<NumThreadsPerWarp>,_W,_1>,Stride<_0,_1,_0>>{};            //   tv_idx -> warp_idx
+    Layout tv2warp = Layout<Shape<Int<LaneWidth>,_W,_1>,Stride<_0,_1,_0>>{};                    //   tv_idx -> warp_idx
     Layout ref2warp = composition(tv2warp, ref_layout_MN);                                      //  tile_mn -> warp_idx
     Layout warp_layout_MN = make_layout(filter(get<0>(ref2warp)), filter(get<1>(ref2warp)));    //  warp_mn -> warp_idx
     Layout inv_warp_layout_MN = right_inverse(warp_layout_MN);                                  // warp_idx -> warp_mn
 
-    int warp_idx = args.thread_idx / NumThreadsPerWarp;
+    int warp_idx = args.thread_idx / LaneWidth;
     auto warp_mn = idx2crd(inv_warp_layout_MN(warp_idx), shape(warp_layout_MN));
 
     // Partition output gmem and register tensors
