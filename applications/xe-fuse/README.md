@@ -243,6 +243,96 @@ The pipeline generator maps model architectures to kernel variants:
 - GQA models get correct H_kv dimensions for V/K projections
 - RoPE is conditionally included based on architecture
 
+## MoE Expert Batched GEMM
+
+For Mixture-of-Experts models (LLaMA 4, Mixtral, DeepSeek-V3, DBRX), xe-fuse provides
+batched expert kernels that process all routed experts in a single launch using the
+CUTLASS L (batch) dimension:
+
+```cpp
+#include "xe-fuse/kernels/gemm_moe_expert.hpp"
+
+// SwiGLU variant — one kernel launch for all experts
+using Config = xe_fuse::MoEExpertSwiGLU<bf16, bf16, bf16, float, float, float, TileShape>;
+using Gemm = Config::Gemm;
+
+// Launch: {M_per_expert, N=2*I, K=H, L=num_experts}
+// Each batch slice gets its own fused RMSNorm + SwiGLU epilogue
+```
+
+Instead of 16 separate GEMM + SwiGLU kernel launches (one per expert), a single
+batched launch processes all experts. The fused epilogue runs per-batch-slice, so
+each expert gets its own scale vector and SwiGLU activation without extra launches.
+
+### MoE architectures supported
+
+| Model | H | Expert I | Experts | top_k | Expert GEMM (N×K) |
+|-------|---|----------|---------|-------|--------------------|
+| LLaMA 4 Scout | 5120 | 8192 | 16 | 1 | 16384×5120 |
+| LLaMA 4 Maverick | 5120 | 8192 | 128 | 1 | 16384×5120 |
+| Mixtral 8x7B | 4096 | 14336 | 8 | 2 | 28672×4096 |
+| Mixtral 8x22B | 6144 | 16384 | 8 | 2 | 32768×6144 |
+| DeepSeek-V3 | 7168 | 2048 | 256 | 8 | 4096×7168 |
+| DBRX | 6144 | 10752 | 16 | 4 | 21504×6144 |
+
+### MoE performance (LLaMA 4 Scout, BMG G31, bf16)
+
+| M_total | M_per_expert | Batched (1 launch) | Sequential (16 launches) |
+|---------|-------------|--------------------|--------------------------| 
+| 64 | 4 | 2.4 TFlop/s | 2.3 TFlop/s |
+| 512 | 32 | 18.7 TFlop/s | 18.5 TFlop/s |
+| 2048 | 128 | 63.8 TFlop/s | 61.6 TFlop/s |
+
+Batching gives ~2-3% from reduced launch overhead. The main win is still fusion —
+eliminating per-expert SwiGLU kernel launches saves more than batching at these shapes.
+
+## Autotune Tile Selection
+
+xe-fuse includes a tile shape auto-selector based on empirical sweep data (792 configurations
+across 7 tiles × 5 kernels × 32 GEMM shapes from 10+ model architectures).
+
+```bash
+# Generate pipeline with autotuned tiles for target sequence length
+uv run autotune/generate_pipeline.py --preset llama3_8b --autotune --seq-len 128 -o pipeline.cpp
+
+# Or override tile for a single kernel
+uv run autotune/generate_kernel.py --preset k2 --tile 64x128x32 -o kernel.cpp
+uv run autotune/generate_kernel.py --preset k1 --tile auto --m 128 --n 4096 --k 4096 -o kernel.cpp
+```
+
+The sweep CSV (`tests/best_tiles.csv`) maps each (kernel, M, N, K) to the optimal tile.
+The heuristic rule: tile_M tracks the problem M (64 for M≤64, 128 for M≤128, 256 for M≥256),
+tile_N adapts to the output dimension, and K is always 32 (XMX constraint).
+
+At small M (32-128), optimal tiles are **2-7× faster** than the default 256×256×32.
+
+## xe-fuse vs vllm-xpu (end-to-end)
+
+Full pipeline comparison: xe-fuse (CUTLASS GEMM + fused epilogue) vs vllm-xpu (oneDNN GEMM + SYCL post-ops).
+
+### Dense: LLaMA 3 8B
+
+| M | vllm-xpu | xe-fuse (best tile) | xe-fuse / vllm |
+|---|----------|--------------------|-|
+| 32 | 16.6 TF/s | 14.8 TF/s | 0.89x |
+| 128 | 57.6 TF/s | 51.3 TF/s | 0.89x |
+| 256 | 94.7 TF/s | 92.6 TF/s | 0.98x |
+| 512 | 118.8 TF/s | 124.9 TF/s | **1.05x** |
+| 1024 | 115.4 TF/s | 130.8 TF/s | **1.13x** |
+| 2048 | 116.2 TF/s | 131.5 TF/s | **1.13x** |
+
+### MoE: LLaMA 4 Scout (16 experts)
+
+| M_total | vllm-xpu | xe-fuse batched | xe-fuse / vllm |
+|---------|----------|----------------|-|
+| 256 | 64.7 TF/s | 57.0 TF/s | 0.88x |
+| 512 | 91.9 TF/s | 81.9 TF/s | 0.89x |
+| 1024 | 106.5 TF/s | 116.0 TF/s | **1.09x** |
+| 2048 | 111.6 TF/s | 134.3 TF/s | **1.20x** |
+
+xe-fuse wins at M≥512 (dense) and M≥1024 (MoE), reaching up to 82% of BF16 peak.
+The remaining gap at small M is the CUTLASS Xe mainloop vs oneDNN — not tiling or fusion.
+
 ## File Layout
 
 ```
@@ -254,18 +344,25 @@ xe-fuse/
 │   │   ├── xe_pairwise_compute.hpp     — Pairwise: SwiGLU, GeGLU, generic pairs
 │   │   ├── xe_rope_compute.hpp         — RoPE: 3 visitor variants
 │   │   └── xe_scalerows_compute.hpp    — Merged: ScaleRows, SwiGLUScaled, GeGLUScaled
-│   ├── kernels/                        — Complete GEMM+epilogue configs
+│   ├── kernels/
+│   │   ├── gemm_rmsnorm.hpp            — K1: GEMM + RMSNorm
+│   │   ├── gemm_rmsnorm_swiglu.hpp     — K2: GEMM + RMSNorm + SwiGLU
+│   │   ├── gemm_rmsnorm_rope.hpp       — K4: GEMM + RMSNorm + RoPE
+│   │   ├── gemm_residual_gamma.hpp     — K0a: GEMM + residual + gamma
+│   │   ├── gemm_dual_output.hpp        — K0: split-tree dual output
+│   │   ├── gemm_moe_expert.hpp         — MoE: batched expert GEMM + SwiGLU/GeGLU
+│   │   └── ...
 │   └── standalone/ops.hpp              — Element-wise SYCL baselines
 ├── autotune/
-│   ├── generate_kernel.py              — Single-kernel code generator
-│   ├── generate_pipeline.py            — Model pipeline code generator
-│   ├── model_presets.py                — Architecture configs (10 models)
+│   ├── generate_kernel.py              — Single-kernel code generator (--tile auto)
+│   ├── generate_pipeline.py            — Model pipeline code generator (--autotune)
+│   ├── tile_selector.py                — Autotune tile selection from sweep data
+│   ├── model_presets.py                — Architecture configs (10+ models)
 │   ├── pipeline_template.cpp.j2        — Pipeline Jinja2 template
-│   ├── kernel_template.cpp.j2          — Kernel Jinja2 template
-│   └── run_kernel.sh                   — sbatch compile + run wrapper
+│   └── kernel_template.cpp.j2          — Kernel Jinja2 template
 ├── tests/
-│   ├── run_model_pipeline.sh           — sbatch: generate → compile → test
-│   └── run_llama_pipeline.sh           — Original LLaMA-specific test
+│   ├── best_tiles.csv                  — Sweep results: 792 (kernel, M, N, K) → best tile
+│   └── run_model_pipeline.sh           — sbatch: generate → compile → test
 ```
 
 ## Performance (BMG G31, bf16, 256×256×32 tiles)
