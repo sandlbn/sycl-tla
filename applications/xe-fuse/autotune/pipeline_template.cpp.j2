@@ -37,15 +37,24 @@ namespace b = xe_fuse::builder;
 
 // === Kernel type definitions ===
 
-{% if use_rope %}
-using QK_Config = xe_fuse::GemmRmsNormRoPE<>;
-{% else %}
-using QK_Config = xe_fuse::GemmRmsNorm<>;
-{% endif %}
-using K1_Config = xe_fuse::GemmRmsNorm<>;
-using K0_Config = xe_fuse::GemmDualOutput<>;
+// Tile shape — autotune-selected or default 256x256x32
+using TileShape = cute::Shape<cute::{{ (tile_shape | default("_256, _256, _32")).replace(", ", ", cute::") }}>;
 
-using TileShape = cute::Shape<cute::_256, cute::_256, cute::_32>;
+{% if use_rope %}
+using QK_Config = xe_fuse::GemmRmsNormRoPE<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float, float, float, float, TileShape>;
+{% else %}
+using QK_Config = xe_fuse::GemmRmsNorm<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float, float, float, TileShape>;
+{% endif %}
+using K1_Config = xe_fuse::GemmRmsNorm<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float, float, float, TileShape>;
+using K0_Config = xe_fuse::GemmDualOutput<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    cutlass::bfloat16_t, float, float, float, TileShape>;
 
 {% if ffn_activation == "swiglu" %}
 using FFN_EVT = b::SwiGLU<b::ScaleRows<b::Acc, TileShape, float>>;
@@ -65,7 +74,7 @@ struct BareGemm {
   using ElementCompute = float;
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
-  using BTS = cute::Shape<cute::_256, cute::_256, cute::_32>;
+  using BTS = TileShape;
   using StrideC = cute::Stride<int64_t, cute::Int<1>, int64_t>;
   using StrideD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 

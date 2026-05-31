@@ -730,6 +730,8 @@ def main():
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
     parser.add_argument("--iterations", type=int, default=200)
+    parser.add_argument("--tile", type=str, default=None,
+                        help="Override tile shape, e.g. '128x256x32' or 'auto'")
     parser.add_argument("--list-presets", action="store_true",
                         help="List available presets and exit")
     args = parser.parse_args()
@@ -756,6 +758,16 @@ def main():
         parser.error("Provide --preset or --spec")
         return
 
+    # Tile shape override: explicit, auto, or default from preset
+    if args.tile:
+        if args.tile == "auto":
+            from tile_selector import select_tile
+            kernel_tag = args.preset.split("_")[0] if args.preset else "bare"
+            spec["tile_shape"] = select_tile(args.m, args.n, args.k, kernel_tag)
+        else:
+            parts = args.tile.replace("x", ", _").lstrip("_")
+            spec["tile_shape"] = f"_{parts}"
+
     defaults = {"m": args.m, "n": args.n, "k": args.k, "iterations": args.iterations}
     if spec.get("standalone"):
         code = generate_standalone_cpp(spec, defaults)
@@ -768,6 +780,7 @@ def main():
 
     print(f"Generated: {args.output}")
     print(f"  Kernel: {spec['name']}")
+    print(f"  Tile:   {spec.get('tile_shape', '_256, _256, _32')}")
     print(f"  EVT:    {spec['evt_description']}")
 
 
