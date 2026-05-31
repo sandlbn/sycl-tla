@@ -360,6 +360,9 @@ xe-fuse/
 │   ├── model_presets.py                — Architecture configs (10+ models)
 │   ├── pipeline_template.cpp.j2        — Pipeline Jinja2 template
 │   └── kernel_template.cpp.j2          — Kernel Jinja2 template
+├── examples/
+│   ├── moe_expert_builder.cpp          — MoE via builder API (L=num_experts)
+│   └── moe_expert_fused.cpp            — MoE via kernel template
 ├── tests/
 │   ├── best_tiles.csv                  — Sweep results: 792 (kernel, M, N, K) → best tile
 │   └── run_model_pipeline.sh           — sbatch: generate → compile → test
